@@ -1,6 +1,7 @@
 package panda
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -11,13 +12,11 @@ import (
 	"sync"
 
 	"github.com/david415/panda/rijndael"
-	"github.com/golang/protobuf/proto"
+	"github.com/ugorji/go/codec"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/nacl/secretbox"
-
-	panda_proto "github.com/david415/panda/proto"
 )
 
 const (
@@ -29,7 +28,13 @@ const (
 	// (silently, painfully) break clients that are too old to support
 	// them.
 	generatedSecretStringPrefix2 = "r["
+
+	keyExchangeStatusInit      = 0
+	keyExchangeStatusExchange1 = 1
+	keyExchangeStatusExchange2 = 2
 )
+
+var jsonHandle *codec.JsonHandle
 
 // NewSecretString generates a random, human readable string with a special
 // form that includes a checksum which allows typos to be rejected (so long as
@@ -101,7 +106,7 @@ type KeyExchange struct {
 	ShutdownChan chan struct{}
 
 	rand         io.Reader
-	status       panda_proto.KeyExchange_Status
+	status       int
 	meetingPlace MeetingPlace
 	sharedSecret []byte
 	serialised   []byte
@@ -122,7 +127,7 @@ func NewKeyExchange(rand io.Reader, meetingPlace MeetingPlace, sharedSecret []by
 		Log:          func(format string, args ...interface{}) {},
 		rand:         rand,
 		meetingPlace: meetingPlace,
-		status:       panda_proto.KeyExchange_INIT,
+		status:       keyExchangeStatusInit,
 		sharedSecret: sharedSecret,
 		kxBytes:      kxBytes,
 	}
@@ -139,63 +144,68 @@ func NewKeyExchange(rand io.Reader, meetingPlace MeetingPlace, sharedSecret []by
 	return kx, nil
 }
 
+type KeyExchangeJSON struct {
+	status                  int
+	sharedSecret            []byte
+	serialised              []byte
+	kxBytes                 []byte
+	key, meeting1, meeting2 [32]byte
+	dhPublic, dhPrivate     [32]byte
+	sharedKey               [32]byte
+	message1, message2      []byte
+}
+
 func UnmarshalKeyExchange(rand io.Reader, meetingPlace MeetingPlace, serialised []byte) (*KeyExchange, error) {
-	var p panda_proto.KeyExchange
-	if err := proto.Unmarshal(serialised, &p); err != nil {
+	kxj := new(KeyExchangeJSON)
+	dec := codec.NewDecoderBytes(bytes.TrimRight(serialised, "\x00"), jsonHandle)
+	if err := dec.Decode(kxj); err != nil {
 		return nil, err
 	}
-
 	kx := &KeyExchange{
-		rand:         rand,
-		meetingPlace: meetingPlace,
-		status:       p.GetStatus(),
-		sharedSecret: p.SharedSecret,
-		serialised:   serialised,
-		kxBytes:      p.KeyExchangeBytes,
-		message1:     p.Message1,
-		message2:     p.Message2,
+		status:       kxj.status,
+		sharedSecret: kxj.sharedSecret,
+		kxBytes:      kxj.kxBytes,
+		key:          kxj.key,
+		meeting1:     kxj.meeting1,
+		meeting2:     kxj.meeting2,
+		dhPublic:     kxj.dhPublic,
+		dhPrivate:    kxj.dhPrivate,
+		sharedKey:    kxj.sharedKey,
+		message1:     kxj.message1,
+		message2:     kxj.message2,
 	}
-
-	copy(kx.key[:], p.Key)
-	copy(kx.meeting1[:], p.Meeting1)
-	copy(kx.meeting2[:], p.Meeting2)
-	copy(kx.sharedKey[:], p.SharedKey)
-	copy(kx.dhPrivate[:], p.DhPrivate)
 	curve25519.ScalarBaseMult(&kx.dhPublic, &kx.dhPrivate)
-
 	return kx, nil
 }
 
 func (kx *KeyExchange) Marshal() []byte {
 	kx.Lock()
 	defer kx.Unlock()
-
 	return kx.serialised
 }
 
 func (kx *KeyExchange) updateSerialised() error {
-	p := &panda_proto.KeyExchange{
-		Status:           kx.status.Enum(),
-		SharedSecret:     kx.sharedSecret,
-		KeyExchangeBytes: kx.kxBytes,
+	serialised := make([]byte, 0)
+	enc := codec.NewEncoderBytes(&serialised, jsonHandle)
+	kxj := &KeyExchangeJSON{
+		status:       kx.status,
+		sharedSecret: kx.sharedSecret,
+		kxBytes:      kx.kxBytes,
+		key:          kx.key,
+		meeting1:     kx.meeting1,
+		meeting2:     kx.meeting2,
+		dhPublic:     kx.dhPublic,
+		dhPrivate:    kx.dhPrivate,
+		sharedKey:    kx.sharedKey,
+		message1:     kx.message1,
+		message2:     kx.message2,
 	}
-	if kx.status != panda_proto.KeyExchange_INIT {
-		p.DhPrivate = kx.dhPrivate[:]
-		p.Key = kx.key[:]
-		p.Meeting1 = kx.meeting1[:]
-		p.Meeting2 = kx.meeting2[:]
-		p.Message1 = kx.message1
-		p.Message2 = kx.message2
-		p.SharedKey = kx.sharedKey[:]
-	}
-	serialised, err := proto.Marshal(p)
+	err := enc.Encode(kxj)
 	if err != nil {
 		return err
 	}
-
 	kx.Lock()
 	defer kx.Unlock()
-
 	kx.serialised = serialised
 	return nil
 }
@@ -213,11 +223,11 @@ func (kx *KeyExchange) shouldStop() bool {
 
 func (kx *KeyExchange) Run() ([]byte, error) {
 	switch kx.status {
-	case panda_proto.KeyExchange_INIT:
+	case keyExchangeStatusInit:
 		if err := kx.derivePassword(); err != nil {
 			return nil, err
 		}
-		kx.status = panda_proto.KeyExchange_EXCHANGE1
+		kx.status = keyExchangeStatusExchange1
 		err := kx.updateSerialised()
 		if err != nil {
 			return nil, err
@@ -227,11 +237,11 @@ func (kx *KeyExchange) Run() ([]byte, error) {
 			return nil, ShutdownErr
 		}
 		fallthrough
-	case panda_proto.KeyExchange_EXCHANGE1:
+	case keyExchangeStatusExchange1:
 		if err := kx.exchange1(); err != nil {
 			return nil, err
 		}
-		kx.status = panda_proto.KeyExchange_EXCHANGE2
+		kx.status = keyExchangeStatusExchange2
 		err := kx.updateSerialised()
 		if err != nil {
 			return nil, err
@@ -241,7 +251,7 @@ func (kx *KeyExchange) Run() ([]byte, error) {
 			return nil, ShutdownErr
 		}
 		fallthrough
-	case panda_proto.KeyExchange_EXCHANGE2:
+	case keyExchangeStatusExchange2:
 		reply, err := kx.exchange2()
 		if err != nil {
 			return nil, err
@@ -358,4 +368,9 @@ func (kx *KeyExchange) exchange2() ([]byte, error) {
 	}
 	message = message[:int(l)]
 	return message, nil
+}
+
+func init() {
+	jsonHandle = new(codec.JsonHandle)
+	jsonHandle.Canonical = true
 }
